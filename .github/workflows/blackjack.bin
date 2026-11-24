@@ -1,0 +1,955 @@
+name: Build Blackjack APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Create project files
+        run: |
+          mkdir BlackjackBot && cd BlackjackBot
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.blackjackbot"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.blackjackbot"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              // Распознавание текста (цифры очков и ранги карт); модель встроена в приложение
+              implementation("com.google.mlkit:text-recognition:16.0.0")
+              implementation("com.google.android.gms:play-services-tasks:18.2.0")
+          }
+          EOF_FILE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:label="@string/app_name"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".BotService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaProjection" />
+
+                  <service
+                      android:name=".TapService"
+                      android:exported="true"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/blackjackbot
+          cat > app/src/main/java/com/example/blackjackbot/BotService.kt <<'EOF_FILE'
+          package com.example.blackjackbot
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.Bitmap
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.Icon
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
+          import android.media.Image
+          import android.media.ImageReader
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.Build
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.util.DisplayMetrics
+          import android.view.WindowManager
+          import com.google.android.gms.tasks.Tasks
+          import com.google.mlkit.vision.common.InputImage
+          import com.google.mlkit.vision.text.TextRecognition
+          import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+          import java.util.concurrent.TimeUnit
+
+          /** Foreground-сервис: снимает экран, читает карты и играет по базовой стратегии блэкджека. */
+          class BotService : Service() {
+
+              companion object {
+                  const val ACTION_STOP = "com.example.blackjackbot.STOP"
+                  const val EXTRA_CODE = "code"
+                  const val EXTRA_DATA = "data"
+
+                  const val HIT = 0
+                  const val STAND = 1
+                  const val DOUBLE = 2
+
+                  @Volatile var running = false
+
+                  /** Максимум раздач (0 = без ограничения). */
+                  @Volatile var maxRounds = 0
+
+                  /** Остановиться, если баланс ниже (0 = выключено). */
+                  @Volatile var stopBelow = 0
+
+                  /** Остановиться, если баланс достиг или выше (0 = выключено). */
+                  @Volatile var stopAbove = 0
+
+                  /** Разрешить удвоение ×2. */
+                  @Volatile var allowDouble = true
+
+                  @Volatile var rounds = 0
+                  @Volatile var startBalance = -1
+                  @Volatile var lastBalance = -1
+
+                  /** Что бот видел и решил в последний раз (для отладки). */
+                  @Volatile var lastInfo = ""
+
+                  /**
+                   * Базовая стратегия блэкджека без сплитов.
+                   * total — сумма очков игрока, soft — есть туз, считаемый за 11, up — карта дилера (2..11, туз = 11).
+                   */
+                  fun decide(total: Int, soft: Boolean, up: Int, canDouble: Boolean): Int {
+                      if (soft) {
+                          return when {
+                              total >= 19 -> STAND
+                              total == 18 -> when {
+                                  up in 3..6 -> if (canDouble) DOUBLE else STAND
+                                  up in 9..11 -> HIT
+                                  else -> STAND
+                              }
+                              total == 17 -> if (up in 3..6 && canDouble) DOUBLE else HIT
+                              total in 15..16 -> if (up in 4..6 && canDouble) DOUBLE else HIT
+                              total in 13..14 -> if (up in 5..6 && canDouble) DOUBLE else HIT
+                              else -> HIT
+                          }
+                      }
+                      return when {
+                          total >= 17 -> STAND
+                          total in 13..16 -> if (up in 2..6) STAND else HIT
+                          total == 12 -> if (up in 4..6) STAND else HIT
+                          total == 11 -> if (up <= 10 && canDouble) DOUBLE else HIT
+                          total == 10 -> if (up <= 9 && canDouble) DOUBLE else HIT
+                          total == 9 -> if (up in 3..6 && canDouble) DOUBLE else HIT
+                          else -> HIT
+                      }
+                  }
+              }
+
+              /** Признаки кадра, которые считаются быстро (без распознавания текста). */
+              private class Snap(
+                  val time: Long,
+                  val btnY: Float,      // центр красной кнопки (доля высоты), -1 если нет
+                  val yellow: Boolean   // есть жёлтая кнопка «×2»
+              )
+
+              /** Слово, найденное на экране. */
+              private class Tok(val text: String, val cx: Int, val cy: Int)
+
+              private var projection: MediaProjection? = null
+              private var virtualDisplay: VirtualDisplay? = null
+              private var reader: ImageReader? = null
+              @Volatile private var alive = false
+              private var worker: Thread? = null
+
+              private val recognizer by lazy {
+                  TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+              }
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent?.action == ACTION_STOP) {
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+                  if (running) return START_NOT_STICKY
+
+                  startForegroundCompat()
+
+                  val code = intent?.getIntExtra(EXTRA_CODE, 0) ?: 0
+                  @Suppress("DEPRECATION")
+                  val data: Intent? = intent?.getParcelableExtra(EXTRA_DATA)
+                  if (data == null) {
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+
+                  val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  projection = mpm.getMediaProjection(code, data)
+                  projection?.registerCallback(object : MediaProjection.Callback() {
+                      override fun onStop() {
+                          stopSelf()
+                      }
+                  }, Handler(Looper.getMainLooper()))
+
+                  val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                  val dm = DisplayMetrics()
+                  @Suppress("DEPRECATION")
+                  wm.defaultDisplay.getRealMetrics(dm)
+                  val w = dm.widthPixels
+                  val h = dm.heightPixels
+
+                  reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 3)
+                  virtualDisplay = projection?.createVirtualDisplay(
+                      "bjbot", w, h, dm.densityDpi,
+                      DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                      reader!!.surface, null, null
+                  )
+
+                  rounds = 0
+                  startBalance = -1
+                  lastBalance = -1
+                  lastInfo = "Старт через ${Config.START_DELAY_MS / 1000} с"
+                  running = true
+                  alive = true
+                  worker = Thread { loop(w, h) }.also { it.start() }
+                  return START_NOT_STICKY
+              }
+
+              // ---------- работа с пикселями ----------
+
+              private fun rgb(image: Image, w: Int, h: Int, x: Int, y: Int): Int {
+                  val plane = image.planes[0]
+                  val xx = x.coerceIn(0, w - 1)
+                  val yy = y.coerceIn(0, h - 1)
+                  val off = yy * plane.rowStride + xx * plane.pixelStride
+                  val buf = plane.buffer
+                  val r = buf.get(off).toInt() and 0xFF
+                  val g = buf.get(off + 1).toInt() and 0xFF
+                  val b = buf.get(off + 2).toInt() and 0xFF
+                  return (r shl 16) or (g shl 8) or b
+              }
+
+              private fun isCrimson(c: Int): Boolean {
+                  val r = (c shr 16) and 0xFF
+                  val g = (c shr 8) and 0xFF
+                  val b = c and 0xFF
+                  return r in 170..215 && g in 45..90 && b in 70..120
+              }
+
+              private fun isYellow(c: Int): Boolean {
+                  val r = (c shr 16) and 0xFF
+                  val g = (c shr 8) and 0xFF
+                  val b = c and 0xFF
+                  return r > 225 && g in 180..215 && b in 80..135
+              }
+
+              private fun makeSnap(image: Image, w: Int, h: Int, now: Long): Snap {
+                  // красная кнопка: сплошная красная полоса в колонке слева
+                  val bx = (Config.BTN_COL_X * w).toInt()
+                  var btn = -1f
+                  var runStart = -1
+                  val minRun = (0.03f * h).toInt()
+                  var y = (0.15f * h).toInt()
+                  val yEnd = (0.985f * h).toInt()
+                  while (y < yEnd) {
+                      if (isCrimson(rgb(image, w, h, bx, y))) {
+                          if (runStart < 0) runStart = y
+                      } else if (runStart >= 0) {
+                          if (y - runStart >= minRun) {
+                              btn = ((runStart + y) / 2f) / h
+                              break
+                          }
+                          runStart = -1
+                      }
+                      y += 2
+                  }
+
+                  val yellow = isYellow(rgb(image, w, h, (Config.YELLOW_X1 * w).toInt(), (Config.YELLOW_Y1 * h).toInt())) ||
+                      isYellow(rgb(image, w, h, (Config.YELLOW_X2 * w).toInt(), (Config.YELLOW_Y2 * h).toInt()))
+                  return Snap(now, btn, yellow)
+              }
+
+              // ---------- распознавание текста ----------
+
+              /**
+               * Вырезает полосу экрана, делает её чёрно-белой (светлый и красный текст -> чёрный на белом)
+               * и распознаёт слова. Возвращает слова с координатами в пикселях экрана.
+               */
+              private fun readTokens(image: Image, w: Int, h: Int, yf0: Float, yf1: Float): List<Tok> {
+                  val y0 = (yf0 * h).toInt().coerceIn(0, h - 1)
+                  val y1 = (yf1 * h).toInt().coerceIn(y0 + 1, h)
+                  val rows = y1 - y0
+                  val plane = image.planes[0]
+                  val buf = plane.buffer
+                  val rs = plane.rowStride
+                  val ps = plane.pixelStride
+
+                  val px = IntArray(w * rows)
+                  for (yy in 0 until rows) {
+                      val base = (y0 + yy) * rs
+                      for (xx in 0 until w) {
+                          val off = base + xx * ps
+                          val r = buf.get(off).toInt() and 0xFF
+                          val g = buf.get(off + 1).toInt() and 0xFF
+                          val b = buf.get(off + 2).toInt() and 0xFF
+                          val text = (r > 150 && g > 150 && b > 150) || (r > 150 && g < 110 && b < 120)
+                          px[yy * w + xx] = if (text) 0xFF000000.toInt() else 0xFFFFFFFF.toInt()
+                      }
+                  }
+                  val bmp = Bitmap.createBitmap(px, w, rows, Bitmap.Config.ARGB_8888)
+                  val out = ArrayList<Tok>()
+                  try {
+                      val result = Tasks.await(
+                          recognizer.process(InputImage.fromBitmap(bmp, 0)), 5, TimeUnit.SECONDS
+                      )
+                      for (block in result.textBlocks) {
+                          for (line in block.lines) {
+                              for (el in line.elements) {
+                                  val box = el.boundingBox ?: continue
+                                  out.add(Tok(el.text, box.centerX(), box.centerY() + y0))
+                              }
+                          }
+                      }
+                  } catch (e: Exception) {
+                      // не распознали — вернём то, что есть
+                  } finally {
+                      bmp.recycle()
+                  }
+                  return out
+              }
+
+              private fun normalize(s: String): String {
+                  // русские буквы, похожие на латинские
+                  return s.uppercase()
+                      .replace('А', 'A')
+                      .replace('К', 'K')
+                      .replace('О', '0')
+                      .replace('O', '0')
+                      .replace(" ", "")
+              }
+
+              /** Очки из значка: "17" -> 17, "4+" -> 4, "A+" -> 11. */
+              private fun parseBadge(t: String): Int? {
+                  val s = normalize(t).replace("+", "")
+                  if (s == "A") return 11
+                  val n = s.toIntOrNull() ?: return null
+                  return if (n == 1) 11 else n
+              }
+
+              /** Достоинство карты по рангу: туз = 1, лицевые = 10. */
+              private fun parseRank(t: String): Int? {
+                  val s = normalize(t)
+                  return when (s) {
+                      "A" -> 1
+                      "J", "Q", "K" -> 10
+                      "10" -> 10
+                      "2", "3", "4", "5", "6", "7", "8", "9" -> s.toInt()
+                      else -> null
+                  }
+              }
+
+              private fun readBalance(image: Image, w: Int, h: Int): Int? {
+                  val toks = readTokens(image, w, h, Config.BAL_Y0, Config.BAL_Y1)
+                      .filter { it.cx > Config.BAL_X_MIN * w }
+                      .sortedBy { it.cx }
+                  val digits = StringBuilder()
+                  for (t in toks) for (ch in t.text) if (ch.isDigit()) digits.append(ch)
+                  if (digits.isEmpty() || digits.length > 9) return null
+                  return digits.toString().toIntOrNull()
+              }
+
+              // ---------- главный цикл ----------
+
+              private fun loop(w: Int, h: Int) {
+                  var held: Image? = null
+                  try {
+                      Thread.sleep(Config.START_DELAY_MS)
+
+                      var snap: Snap? = null
+                      var lastAction = 0L
+                      var settle = 0L
+                      var ocrFail = 0
+
+                      fun tapAt(xf: Float, yf: Float) {
+                          TapService.instance?.tap(xf * w, yf * h)
+                      }
+
+                      fun doAction(ms: Long) {
+                          lastAction = System.currentTimeMillis()
+                          settle = ms
+                      }
+
+                      fun stopAll(reason: String) {
+                          lastInfo = reason
+                          alive = false
+                          stopSelf()
+                      }
+
+                      while (alive) {
+                          Thread.sleep(Config.POLL_MS)
+                          val now = System.currentTimeMillis()
+
+                          // держим последний кадр открытым: если экран не меняется, нового кадра не будет
+                          val img = reader?.acquireLatestImage()
+                          if (img != null) {
+                              held?.close()
+                              held = img
+                              snap = makeSnap(img, w, h, now)
+                          }
+                          val s = snap ?: continue
+                          val im = held ?: continue
+
+                          if (now - lastAction < settle) continue
+                          // после действия ждём хотя бы один новый кадр (но не дольше 2,5 с)
+                          if (s.time < lastAction && now - lastAction < 2500) continue
+
+                          val b = s.btnY
+
+                          if (b >= Config.PLAY_BTN_MIN && b <= Config.PLAY_BTN_MAX) {
+                              // ---- идёт раздача: решаем Ещё / Хватит / ×2 ----
+                              val toks = readTokens(im, w, h, Config.TABLE_Y0, Config.TABLE_Y1)
+                              fun band(y0: Float, y1: Float) =
+                                  toks.filter { it.cy >= y0 * h && it.cy <= y1 * h }.sortedBy { it.cx }
+
+                              val dealerUp = band(Config.DEALER_BADGE_Y0, Config.DEALER_BADGE_Y1)
+                                  .mapNotNull { parseBadge(it.text) }.firstOrNull()
+                                  ?: band(Config.DEALER_RANK_Y0, Config.DEALER_RANK_Y1)
+                                      .mapNotNull { parseRank(it.text) }.firstOrNull()
+                                      ?.let { if (it == 1) 11 else it }
+                              val badge = band(Config.PLAYER_BADGE_Y0, Config.PLAYER_BADGE_Y1)
+                                  .filter { !it.text.contains("+") }
+                                  .mapNotNull { parseBadge(it.text) }.firstOrNull()
+                              val ranks = band(Config.PLAYER_RANK_Y0, Config.PLAYER_RANK_Y1)
+                                  .filter { it.cx > 0.25f * w && it.cx < 0.75f * w }
+                                  .mapNotNull { parseRank(it.text) }
+
+                              // считаем очки игрока по рангам и сверяем со значком
+                              var total = -1
+                              var soft = false
+                              if (ranks.size >= 2) {
+                                  var hard = 0
+                                  var aces = 0
+                                  for (r in ranks) {
+                                      hard += r
+                                      if (r == 1) aces++
+                                  }
+                                  if (aces > 0 && hard + 10 <= 21) {
+                                      total = hard + 10
+                                      soft = true
+                                  } else {
+                                      total = hard
+                                  }
+                                  if (badge != null && badge != total) {
+                                      // ранги прочитались неточно — верим значку
+                                      total = badge
+                                      soft = aces > 0 && ranks.size == 2 && badge in 12..21
+                                  }
+                              } else if (badge != null) {
+                                  total = badge
+                              }
+
+                              if (total < 0 || dealerUp == null) {
+                                  ocrFail++
+                                  lastInfo = "Не прочитал карты (попытка $ocrFail): очки=$badge дилер=$dealerUp"
+                                  if (ocrFail >= 3) {
+                                      ocrFail = 0
+                                      tapAt(if (s.yellow) Config.STAND_X_3 else Config.STAND_X_2, b)
+                                      lastInfo += " — нажал «Хватит»"
+                                      doAction(Config.STAND_SETTLE_MS)
+                                  } else {
+                                      doAction(500)
+                                  }
+                                  continue
+                              }
+                              ocrFail = 0
+
+                              val canDouble = allowDouble && s.yellow
+                              val action = decide(total, soft, dealerUp, canDouble)
+                              val name = when (action) {
+                                  HIT -> "Ещё"
+                                  DOUBLE -> "×2"
+                                  else -> "Хватит"
+                              }
+                              lastInfo = "Ты: $total${if (soft) " (мягкая)" else ""}, дилер: $dealerUp → $name"
+
+                              when (action) {
+                                  HIT -> {
+                                      tapAt(if (s.yellow) Config.HIT_X_3 else Config.HIT_X_2, b)
+                                      doAction(Config.HIT_SETTLE_MS)
+                                  }
+                                  DOUBLE -> {
+                                      tapAt(Config.DOUBLE_X, b)
+                                      doAction(Config.STAND_SETTLE_MS)
+                                  }
+                                  else -> {
+                                      tapAt(if (s.yellow) Config.STAND_X_3 else Config.STAND_X_2, b)
+                                      doAction(Config.STAND_SETTLE_MS)
+                                  }
+                              }
+                          } else if (b >= Config.DEAL_BTN_MIN && b <= Config.DEAL_BTN_MAX) {
+                              // ---- экран перед раздачей / результат: нужна новая раздача ----
+                              if (maxRounds > 0 && rounds >= maxRounds) {
+                                  stopAll("Готово: сыграно раздач — $rounds")
+                                  continue
+                              }
+                              if (stopBelow > 0 || stopAbove > 0 || startBalance < 0) {
+                                  val bal = readBalance(im, w, h)
+                                  if (bal != null) {
+                                      lastBalance = bal
+                                      if (startBalance < 0) startBalance = bal
+                                      if (stopBelow > 0 && bal < stopBelow) {
+                                          stopAll("Остановлен: баланс $bal ниже $stopBelow")
+                                          continue
+                                      }
+                                      if (stopAbove > 0 && bal >= stopAbove) {
+                                          stopAll("Остановлен: баланс $bal достиг $stopAbove")
+                                          continue
+                                      }
+                                  }
+                              }
+                              tapAt(0.5f, b)
+                              rounds++
+                              lastInfo = "Раздача №$rounds"
+                              doAction(Config.DEAL_SETTLE_MS)
+                          }
+                          // иначе: анимация / переход — просто ждём следующий кадр
+                      }
+                  } catch (e: InterruptedException) {
+                      // остановка
+                  } catch (e: Exception) {
+                      lastInfo = "Ошибка: ${e.javaClass.simpleName}"
+                  } finally {
+                      try {
+                          held?.close()
+                      } catch (e: Exception) {
+                      }
+                  }
+              }
+
+              private fun startForegroundCompat() {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(
+                      NotificationChannel("bjbot", "Блэкджек Бот", NotificationManager.IMPORTANCE_LOW)
+                  )
+                  val stopIntent = PendingIntent.getService(
+                      this, 0,
+                      Intent(this, BotService::class.java).setAction(ACTION_STOP),
+                      PendingIntent.FLAG_IMMUTABLE
+                  )
+                  val n = Notification.Builder(this, "bjbot")
+                      .setContentTitle("Блэкджек Бот работает")
+                      .setContentText("Нажми, чтобы остановить")
+                      .setSmallIcon(android.R.drawable.ic_media_play)
+                      .setContentIntent(stopIntent)
+                      .addAction(
+                          Notification.Action.Builder(
+                              Icon.createWithResource(this, android.R.drawable.ic_media_pause), "Стоп", stopIntent
+                          ).build()
+                      )
+                      .build()
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+                  } else {
+                      startForeground(1, n)
+                  }
+              }
+
+              override fun onDestroy() {
+                  alive = false
+                  running = false
+                  worker?.interrupt()
+                  virtualDisplay?.release()
+                  reader?.close()
+                  projection?.stop()
+                  super.onDestroy()
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/blackjackbot
+          cat > app/src/main/java/com/example/blackjackbot/Config.kt <<'EOF_FILE'
+          package com.example.blackjackbot
+
+          /**
+           * Координаты — доли экрана (0..1), посчитаны по скриншотам игры «Блэкджек».
+           * Если игра обновит дизайн, меняй значения здесь.
+           */
+          object Config {
+              // Колонка экрана, по которой ищем красную кнопку (слева, без текста и карт)
+              const val BTN_COL_X = 0.12f
+
+              // Красная кнопка «Ещё» во время игры (кнопки действий) — диапазон по высоте
+              const val PLAY_BTN_MIN = 0.50f
+              const val PLAY_BTN_MAX = 0.57f
+
+              // Красная кнопка «Раздать» / «Ещё раздачу» — диапазон по высоте
+              const val DEAL_BTN_MIN = 0.62f
+              const val DEAL_BTN_MAX = 0.80f
+
+              // Позиции кнопок действий по горизонтали.
+              // Есть жёлтая «×2»: Ещё | Хватит | ×2. Нет «×2»: Ещё | Хватит.
+              const val HIT_X_3 = 0.182f
+              const val STAND_X_3 = 0.500f
+              const val DOUBLE_X = 0.818f
+              const val HIT_X_2 = 0.262f
+              const val STAND_X_2 = 0.738f
+
+              // Где ищем жёлтую «×2»
+              const val YELLOW_X1 = 0.818f
+              const val YELLOW_Y1 = 0.533f
+              const val YELLOW_X2 = 0.800f
+              const val YELLOW_Y2 = 0.521f
+
+              // Полосы экрана для чтения (доли высоты): значок очков дилера и игрока, ранги карт
+              const val TABLE_Y0 = 0.185f
+              const val TABLE_Y1 = 0.425f
+              const val DEALER_BADGE_Y0 = 0.190f
+              const val DEALER_BADGE_Y1 = 0.235f
+              const val DEALER_RANK_Y0 = 0.235f
+              const val DEALER_RANK_Y1 = 0.272f
+              const val PLAYER_BADGE_Y0 = 0.338f
+              const val PLAYER_BADGE_Y1 = 0.376f
+              const val PLAYER_RANK_Y0 = 0.380f
+              const val PLAYER_RANK_Y1 = 0.418f
+
+              // Баланс в шапке (читаем перед каждой раздачей, если заданы лимиты)
+              const val BAL_Y0 = 0.10f
+              const val BAL_Y1 = 0.17f
+              const val BAL_X_MIN = 0.70f
+
+              // Паузы (мс)
+              const val START_DELAY_MS = 5000L   // после запуска, чтобы успеть открыть игру
+              const val POLL_MS = 60L            // как часто смотрим экран
+              const val HIT_SETTLE_MS = 1000L    // после «Ещё»
+              const val STAND_SETTLE_MS = 1600L  // после «Хватит» / «×2» (дилер добирает)
+              const val DEAL_SETTLE_MS = 1400L   // после «Раздать»
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/blackjackbot
+          cat > app/src/main/java/com/example/blackjackbot/MainActivity.kt <<'EOF_FILE'
+          package com.example.blackjackbot
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Context
+          import android.content.Intent
+          import android.content.SharedPreferences
+          import android.content.pm.PackageManager
+          import android.media.projection.MediaProjectionManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+
+              private lateinit var status: TextView
+              private lateinit var roundsText: TextView
+              private lateinit var belowText: TextView
+              private lateinit var aboveText: TextView
+              private lateinit var doubleBtn: Button
+              private lateinit var prefs: SharedPreferences
+              private val reqProjection = 1001
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  prefs = getSharedPreferences("blackjack", Context.MODE_PRIVATE)
+                  BotService.maxRounds = prefs.getInt("max_rounds", 0)
+                  BotService.stopBelow = prefs.getInt("stop_below", 0)
+                  BotService.stopAbove = prefs.getInt("stop_above", 0)
+                  BotService.allowDouble = prefs.getBoolean("allow_double", true)
+
+                  val pad = (20 * resources.displayMetrics.density).toInt()
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(pad, pad * 2, pad, pad)
+                  }
+
+                  fun label(): TextView {
+                      val t = TextView(this)
+                      t.textSize = 16f
+                      t.gravity = Gravity.CENTER
+                      t.setPadding(0, pad / 2, 0, pad / 4)
+                      root.addView(t)
+                      return t
+                  }
+
+                  fun buttonRow(vararg items: Pair<String, () -> Unit>) {
+                      val row = LinearLayout(this)
+                      row.orientation = LinearLayout.HORIZONTAL
+                      for ((text, action) in items) {
+                          val b = Button(this)
+                          b.text = text
+                          b.layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                          b.setOnClickListener { action() }
+                          row.addView(b)
+                      }
+                      root.addView(row)
+                  }
+
+                  status = label()
+
+                  roundsText = label()
+                  buttonRow(
+                      "−10" to { changeRounds(-10) },
+                      "−1" to { changeRounds(-1) },
+                      "+1" to { changeRounds(1) },
+                      "+10" to { changeRounds(10) }
+                  )
+
+                  belowText = label()
+                  buttonRow(
+                      "−1000" to { changeBelow(-1000) },
+                      "−100" to { changeBelow(-100) },
+                      "+100" to { changeBelow(100) },
+                      "+1000" to { changeBelow(1000) }
+                  )
+
+                  aboveText = label()
+                  buttonRow(
+                      "−1000" to { changeAbove(-1000) },
+                      "−100" to { changeAbove(-100) },
+                      "+100" to { changeAbove(100) },
+                      "+1000" to { changeAbove(1000) }
+                  )
+
+                  val db = Button(this)
+                  doubleBtn = db
+                  db.setOnClickListener {
+                      BotService.allowDouble = !BotService.allowDouble
+                      prefs.edit().putBoolean("allow_double", BotService.allowDouble).apply()
+                      refreshTexts()
+                  }
+                  root.addView(db)
+
+                  val spacer = TextView(this)
+                  spacer.setPadding(0, pad, 0, 0)
+                  root.addView(spacer)
+                  buttonRow("1. Включить спец. возможности" to {
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                  })
+                  buttonRow("2. Запустить бота" to { startBot() })
+                  buttonRow("Остановить" to {
+                      startService(Intent(this, BotService::class.java).setAction(BotService.ACTION_STOP))
+                  })
+
+                  val scroll = ScrollView(this)
+                  scroll.addView(root)
+                  setContentView(scroll)
+                  refreshTexts()
+
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 2002)
+                  }
+              }
+
+              private fun changeRounds(delta: Int) {
+                  val v = (BotService.maxRounds + delta).coerceIn(0, 10000)
+                  BotService.maxRounds = v
+                  prefs.edit().putInt("max_rounds", v).apply()
+                  refreshTexts()
+              }
+
+              private fun changeBelow(delta: Int) {
+                  val v = (BotService.stopBelow + delta).coerceIn(0, 100000000)
+                  BotService.stopBelow = v
+                  prefs.edit().putInt("stop_below", v).apply()
+                  refreshTexts()
+              }
+
+              private fun changeAbove(delta: Int) {
+                  val v = (BotService.stopAbove + delta).coerceIn(0, 100000000)
+                  BotService.stopAbove = v
+                  prefs.edit().putInt("stop_above", v).apply()
+                  refreshTexts()
+              }
+
+              private fun refreshTexts() {
+                  roundsText.text = if (BotService.maxRounds == 0)
+                      "Раздач: без ограничения"
+                  else
+                      "Остановиться после раздач: ${BotService.maxRounds}"
+                  belowText.text = if (BotService.stopBelow == 0)
+                      "Стоп, если баланс ниже: выключено"
+                  else
+                      "Стоп, если баланс ниже: ${BotService.stopBelow}"
+                  aboveText.text = if (BotService.stopAbove == 0)
+                      "Стоп, если баланс выше: выключено"
+                  else
+                      "Стоп, если баланс выше: ${BotService.stopAbove}"
+                  doubleBtn.text = if (BotService.allowDouble) "Удвоение ×2: ВКЛ" else "Удвоение ×2: ВЫКЛ"
+              }
+
+              private fun startBot() {
+                  if (TapService.instance == null) {
+                      Toast.makeText(this, "Сначала включи спец. возможности (шаг 1)", Toast.LENGTH_LONG).show()
+                      return
+                  }
+                  val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  @Suppress("DEPRECATION")
+                  startActivityForResult(mpm.createScreenCaptureIntent(), reqProjection)
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode == reqProjection && resultCode == RESULT_OK && data != null) {
+                      val i = Intent(this, BotService::class.java)
+                      i.putExtra(BotService.EXTRA_CODE, resultCode)
+                      i.putExtra(BotService.EXTRA_DATA, data)
+                      startForegroundService(i)
+                      Toast.makeText(
+                          this,
+                          "Старт через ${Config.START_DELAY_MS / 1000} c — открой игру «Блэкджек»",
+                          Toast.LENGTH_LONG
+                      ).show()
+                      moveTaskToBack(true)
+                  }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  val a11y = if (TapService.instance != null) "включены" else "выключены"
+                  val bot = if (BotService.running) "работает" else "остановлен"
+                  val sb = StringBuilder()
+                  sb.append("Спец. возможности: $a11y\nБот: $bot\nРаздач: ${BotService.rounds}")
+                  if (BotService.startBalance >= 0 && BotService.lastBalance >= 0) {
+                      val d = BotService.lastBalance - BotService.startBalance
+                      sb.append("\nБаланс: ${BotService.lastBalance} (${if (d >= 0) "+" else ""}$d)")
+                  }
+                  if (BotService.lastInfo.isNotEmpty()) sb.append("\n${BotService.lastInfo}")
+                  status.text = sb.toString()
+                  refreshTexts()
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/blackjackbot
+          cat > app/src/main/java/com/example/blackjackbot/TapService.kt <<'EOF_FILE'
+          package com.example.blackjackbot
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.graphics.Path
+          import android.view.accessibility.AccessibilityEvent
+
+          /** Спец. возможности: умеет делать тап в нужной точке экрана. */
+          class TapService : AccessibilityService() {
+
+              companion object {
+                  @Volatile
+                  var instance: TapService? = null
+              }
+
+              override fun onServiceConnected() {
+                  instance = this
+              }
+
+              override fun onUnbind(intent: android.content.Intent?): Boolean {
+                  instance = null
+                  return super.onUnbind(intent)
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+
+              fun tap(x: Float, y: Float) {
+                  val path = Path().apply { moveTo(x, y) }
+                  val stroke = GestureDescription.StrokeDescription(path, 0, 40)
+                  dispatchGesture(GestureDescription.Builder().addStroke(stroke).build(), null, null)
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'EOF_FILE'
+          <resources>
+              <string name="app_name">Блэкджек Бот</string>
+              <string name="a11y_desc">Нажимает кнопки в игре «Блэкджек»</string>
+          </resources>
+          EOF_FILE
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/accessibility_config.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canPerformGestures="true"
+              android:description="@string/a11y_desc"
+              android:notificationTimeout="100" />
+          EOF_FILE
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          cat > gradle.properties <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF_FILE
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "BlackjackBot"
+          include(":app")
+          EOF_FILE
+      - name: Build
+        working-directory: BlackjackBot
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Blackjack-apk
+          path: BlackjackBot/app/build/outputs/apk/debug/*.apk
